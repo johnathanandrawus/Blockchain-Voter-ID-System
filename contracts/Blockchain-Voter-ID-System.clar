@@ -248,3 +248,140 @@
 
 (define-read-only (has-voted (event-id uint) (voter-id-param uint))
     (is-some (map-get? voter-participation { event-id: event-id, voter-id: voter-id-param })))
+
+(define-map event-analytics
+  { event-id: uint }
+  {
+    total-participation: uint,
+    region-breakdown: (list 10 { region: (string-ascii 10), count: uint }),
+    completion-rate: uint,
+    peak-voting-block: uint
+  }
+)
+
+(define-map voter-engagement-stats
+  { voter-id: uint }
+  {
+    total-votes-cast: uint,
+    participation-streak: uint,
+    last-vote-block: uint,
+    engagement-score: uint
+  }
+)
+
+(define-map regional-stats
+  { region-code: (string-ascii 10) }
+  {
+    total-voters: uint,
+    active-voters: uint,
+    participation-rate: uint,
+    total-votes-cast: uint
+  }
+)
+
+(define-data-var analytics-enabled bool true)
+
+(define-private (update-voter-engagement (voter-id-param uint) (event-id uint))
+    (let
+        ((current-stats (default-to 
+            { total-votes-cast: u0, participation-streak: u0, last-vote-block: u0, engagement-score: u0 }
+            (map-get? voter-engagement-stats { voter-id: voter-id-param })))
+         (new-total (+ (get total-votes-cast current-stats) u1))
+         (blocks-since-last (- stacks-block-height (get last-vote-block current-stats)))
+         (new-streak (if (<= blocks-since-last u10080) (+ (get participation-streak current-stats) u1) u1))
+         (new-score (+ (* new-total u10) (* new-streak u5))))
+        (map-set voter-engagement-stats
+            { voter-id: voter-id-param }
+            {
+                total-votes-cast: new-total,
+                participation-streak: new-streak,
+                last-vote-block: stacks-block-height,
+                engagement-score: new-score
+            }
+        )
+        (ok true)))
+
+(define-private (update-regional-stats (region-code (string-ascii 10)) (event-id uint))
+    (let
+        ((current-stats (default-to 
+            { total-voters: u0, active-voters: u0, participation-rate: u0, total-votes-cast: u0 }
+            (map-get? regional-stats { region-code: region-code }))))
+        (map-set regional-stats
+            { region-code: region-code }
+            {
+                total-voters: (get total-voters current-stats),
+                active-voters: (get active-voters current-stats),
+                participation-rate: (get participation-rate current-stats),
+                total-votes-cast: (+ (get total-votes-cast current-stats) u1)
+            }
+        )
+        (ok true)))
+
+(define-private (initialize-event-analytics (event-id uint))
+    (map-set event-analytics
+        { event-id: event-id }
+        {
+            total-participation: u0,
+            region-breakdown: (list),
+            completion-rate: u0,
+            peak-voting-block: u0
+        }
+    ))
+
+(define-public (update-analytics-on-vote 
+    (event-id uint)
+    (voter-id-param uint)
+    (region-code (string-ascii 10)))
+    (begin
+        (asserts! (var-get analytics-enabled) (ok true))
+        (unwrap! (update-voter-engagement voter-id-param event-id) (ok true))
+        (unwrap! (update-regional-stats region-code event-id) (ok true))
+        (let
+            ((current-analytics (default-to 
+                { total-participation: u0, region-breakdown: (list), completion-rate: u0, peak-voting-block: u0 }
+                (map-get? event-analytics { event-id: event-id }))))
+            (map-set event-analytics
+                { event-id: event-id }
+                {
+                    total-participation: (+ (get total-participation current-analytics) u1),
+                    region-breakdown: (get region-breakdown current-analytics),
+                    completion-rate: (get completion-rate current-analytics),
+                    peak-voting-block: stacks-block-height
+                }
+            )
+        )
+        (ok true)))
+
+(define-read-only (get-event-analytics (event-id uint))
+    (map-get? event-analytics { event-id: event-id }))
+
+(define-read-only (get-voter-engagement (voter-id-param uint))
+    (map-get? voter-engagement-stats { voter-id: voter-id-param }))
+
+(define-read-only (get-regional-stats (region-code (string-ascii 10)))
+    (map-get? regional-stats { region-code: region-code }))
+
+(define-read-only (get-top-engaged-voters (limit uint))
+    (let
+        ((voter-list (list { voter-id: u1, score: u0 } { voter-id: u2, score: u0 } { voter-id: u3, score: u0 }
+                          { voter-id: u4, score: u0 } { voter-id: u5, score: u0 })))
+        voter-list))
+
+(define-read-only (calculate-participation-rate (event-id uint))
+    (let
+        ((event-analytics-data (map-get? event-analytics { event-id: event-id }))
+         (total-reg (var-get total-registered)))
+        (match event-analytics-data
+            analytics
+            (if (> total-reg u0)
+                (/ (* (get total-participation analytics) u100) total-reg)
+                u0)
+            u0)))
+
+(define-public (toggle-analytics)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (ok (var-set analytics-enabled (not (var-get analytics-enabled))))))
+
+(define-read-only (get-analytics-status)
+    (var-get analytics-enabled))
