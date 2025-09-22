@@ -385,3 +385,264 @@
 
 (define-read-only (get-analytics-status)
     (var-get analytics-enabled))
+
+(define-map delegations
+  { delegator-id: uint }
+  {
+    delegate-id: uint,
+    delegated-at: uint,
+    expires-at: uint,
+    active: bool,
+    delegation-weight: uint
+  }
+)
+
+(define-map delegate-power
+  { delegate-id: uint }
+  {
+    total-delegated-power: uint,
+    active-delegators: uint,
+    max-delegators: uint,
+    accepts-delegations: bool
+  }
+)
+
+(define-map delegation-history
+  { delegator-id: uint, sequence: uint }
+  {
+    delegate-id: uint,
+    action: (string-ascii 20),
+    timestamp: uint,
+    event-id: (optional uint)
+  }
+)
+
+(define-data-var delegation-enabled bool true)
+(define-data-var max-delegation-chain uint u3)
+(define-data-var delegation-expiry-blocks uint u26280)
+
+(define-private (get-delegation-sequence (delegator-id uint))
+    (let
+        ((check-sequence u1))
+        (if (is-some (map-get? delegation-history { delegator-id: delegator-id, sequence: check-sequence }))
+            check-sequence
+            u0)))
+
+(define-public (enable-delegation (max-delegators uint))
+    (let
+        ((voter-record (unwrap! (map-get? voter-records { voter-id: (unwrap! (get-voter-id tx-sender) (err u404)) }) (err u404))))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (is-eq (get status voter-record) "active") (err u407))
+        (asserts! (> (get expires-at voter-record) stacks-block-height) (err u408))
+        (asserts! (> max-delegators u0) (err u400))
+        
+        (map-set delegate-power
+            { delegate-id: (unwrap! (get-voter-id tx-sender) (err u404)) }
+            {
+                total-delegated-power: u0,
+                active-delegators: u0,
+                max-delegators: max-delegators,
+                accepts-delegations: true
+            }
+        )
+        (ok true)))
+
+(define-public (delegate-vote (delegate-voter-id uint) (weight uint))
+    (let
+        ((delegator-voter-id (unwrap! (get-voter-id tx-sender) (err u404)))
+         (delegator-record (unwrap! (map-get? voter-records { voter-id: delegator-voter-id }) (err u404)))
+         (delegate-record (unwrap! (map-get? voter-records { voter-id: delegate-voter-id }) (err u404)))
+         (delegate-power-data (unwrap! (map-get? delegate-power { delegate-id: delegate-voter-id }) (err u405)))
+         (existing-delegation (map-get? delegations { delegator-id: delegator-voter-id }))
+         (sequence (+ (get-delegation-sequence delegator-voter-id) u1)))
+        (asserts! (var-get delegation-enabled) (err u403))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (not (is-eq delegator-voter-id delegate-voter-id)) (err u400))
+        (asserts! (is-eq (get status delegator-record) "active") (err u407))
+        (asserts! (is-eq (get status delegate-record) "active") (err u407))
+        (asserts! (> (get expires-at delegator-record) stacks-block-height) (err u408))
+        (asserts! (> (get expires-at delegate-record) stacks-block-height) (err u408))
+        (asserts! (get accepts-delegations delegate-power-data) (err u409))
+        (asserts! (< (get active-delegators delegate-power-data) (get max-delegators delegate-power-data)) (err u410))
+        (asserts! (is-none existing-delegation) (err u411))
+        (asserts! (and (> weight u0) (<= weight u100)) (err u400))
+        
+        (map-set delegations
+            { delegator-id: delegator-voter-id }
+            {
+                delegate-id: delegate-voter-id,
+                delegated-at: stacks-block-height,
+                expires-at: (+ stacks-block-height (var-get delegation-expiry-blocks)),
+                active: true,
+                delegation-weight: weight
+            }
+        )
+        (map-set delegate-power
+            { delegate-id: delegate-voter-id }
+            {
+                total-delegated-power: (+ (get total-delegated-power delegate-power-data) weight),
+                active-delegators: (+ (get active-delegators delegate-power-data) u1),
+                max-delegators: (get max-delegators delegate-power-data),
+                accepts-delegations: (get accepts-delegations delegate-power-data)
+            }
+        )
+        (map-set delegation-history
+            { delegator-id: delegator-voter-id, sequence: sequence }
+            {
+                delegate-id: delegate-voter-id,
+                action: "delegate",
+                timestamp: stacks-block-height,
+                event-id: none
+            }
+        )
+        (ok true)))
+
+(define-public (revoke-delegation)
+    (let
+        ((delegator-voter-id (unwrap! (get-voter-id tx-sender) (err u404)))
+         (delegation-data (unwrap! (map-get? delegations { delegator-id: delegator-voter-id }) (err u404)))
+         (delegate-power-data (unwrap! (map-get? delegate-power { delegate-id: (get delegate-id delegation-data) }) (err u404)))
+         (sequence (+ (get-delegation-sequence delegator-voter-id) u1)))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (get active delegation-data) (err u400))
+        
+        (map-set delegations
+            { delegator-id: delegator-voter-id }
+            {
+                delegate-id: (get delegate-id delegation-data),
+                delegated-at: (get delegated-at delegation-data),
+                expires-at: stacks-block-height,
+                active: false,
+                delegation-weight: (get delegation-weight delegation-data)
+            }
+        )
+        (map-set delegate-power
+            { delegate-id: (get delegate-id delegation-data) }
+            {
+                total-delegated-power: (- (get total-delegated-power delegate-power-data) (get delegation-weight delegation-data)),
+                active-delegators: (- (get active-delegators delegate-power-data) u1),
+                max-delegators: (get max-delegators delegate-power-data),
+                accepts-delegations: (get accepts-delegations delegate-power-data)
+            }
+        )
+        (map-set delegation-history
+            { delegator-id: delegator-voter-id, sequence: sequence }
+            {
+                delegate-id: (get delegate-id delegation-data),
+                action: "revoke",
+                timestamp: stacks-block-height,
+                event-id: none
+            }
+        )
+        (ok true)))
+
+(define-public (cast-delegated-vote 
+    (event-id uint)
+    (delegate-voter-id uint)
+    (vote-choice (string-ascii 50))
+    (use-delegated-power bool))
+    (let
+        ((event-data (unwrap! (map-get? voting-events { event-id: event-id }) (err u404)))
+         (delegate-record (unwrap! (map-get? voter-records { voter-id: delegate-voter-id }) (err u404)))
+         (delegate-power-data (unwrap! (map-get? delegate-power { delegate-id: delegate-voter-id }) (err u404)))
+         (nft-owner (unwrap! (nft-get-owner? voter-id delegate-voter-id) (err u404)))
+         (voting-power (if use-delegated-power (+ u1 (get total-delegated-power delegate-power-data)) u1)))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (is-eq tx-sender nft-owner) (err u401))
+        (asserts! (get active event-data) (err u400))
+        (asserts! (>= stacks-block-height (get start-block event-data)) (err u405))
+        (asserts! (< stacks-block-height (get end-block event-data)) (err u406))
+        (asserts! (is-eq (get status delegate-record) "active") (err u407))
+        (asserts! (> (get expires-at delegate-record) stacks-block-height) (err u408))
+        (asserts! (is-none (map-get? voter-participation { event-id: event-id, voter-id: delegate-voter-id })) (err u409))
+        
+        (map-set voter-participation
+            { event-id: event-id, voter-id: delegate-voter-id }
+            {
+                voted-at: stacks-block-height,
+                vote-choice: vote-choice
+            }
+        )
+        (map-set voting-events
+            { event-id: event-id }
+            {
+                title: (get title event-data),
+                description: (get description event-data),
+                start-block: (get start-block event-data),
+                end-block: (get end-block event-data),
+                active: (get active event-data),
+                total-votes: (+ (get total-votes event-data) voting-power)
+            }
+        )
+        (ok voting-power)))
+
+(define-public (toggle-delegation-acceptance)
+    (let
+        ((delegate-voter-id (unwrap! (get-voter-id tx-sender) (err u404)))
+         (delegate-power-data (unwrap! (map-get? delegate-power { delegate-id: delegate-voter-id }) (err u404))))
+        (asserts! (not (var-get paused)) (err u403))
+        
+        (map-set delegate-power
+            { delegate-id: delegate-voter-id }
+            {
+                total-delegated-power: (get total-delegated-power delegate-power-data),
+                active-delegators: (get active-delegators delegate-power-data),
+                max-delegators: (get max-delegators delegate-power-data),
+                accepts-delegations: (not (get accepts-delegations delegate-power-data))
+            }
+        )
+        (ok (not (get accepts-delegations delegate-power-data)))))
+
+(define-private (get-voter-id (address principal))
+    (let
+        ((total-ids (var-get last-id)))
+        (match (fold check-voter-ownership (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) none)
+            found-id (some found-id)
+            none)))
+
+(define-private (check-voter-ownership (id-to-check uint) (current-result (optional uint)))
+    (match current-result
+        found (some found)
+        (let
+            ((owner (nft-get-owner? voter-id id-to-check)))
+            (match owner
+                owner-address (if (is-eq owner-address tx-sender) (some id-to-check) none)
+                none))))
+
+(define-read-only (get-delegation (delegator-id uint))
+    (map-get? delegations { delegator-id: delegator-id }))
+
+(define-read-only (get-delegate-power (delegate-id uint))
+    (map-get? delegate-power { delegate-id: delegate-id }))
+
+(define-read-only (get-delegation-history (delegator-id uint) (sequence uint))
+    (map-get? delegation-history { delegator-id: delegator-id, sequence: sequence }))
+
+(define-read-only (calculate-effective-voting-power (voter-id-param uint))
+    (let
+        ((base-power u1)
+         (delegate-power-data (map-get? delegate-power { delegate-id: voter-id-param })))
+        (match delegate-power-data
+            power-data (+ base-power (get total-delegated-power power-data))
+            base-power)))
+
+(define-read-only (is-delegation-active (delegator-id uint))
+    (let
+        ((delegation-data (map-get? delegations { delegator-id: delegator-id })))
+        (match delegation-data
+            data (and 
+                (get active data)
+                (> (get expires-at data) stacks-block-height))
+            false)))
+
+(define-public (toggle-delegation-system)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (ok (var-set delegation-enabled (not (var-get delegation-enabled))))))
+
+(define-read-only (get-delegation-status)
+    {
+        enabled: (var-get delegation-enabled),
+        max-chain-length: (var-get max-delegation-chain),
+        expiry-blocks: (var-get delegation-expiry-blocks)
+    })
