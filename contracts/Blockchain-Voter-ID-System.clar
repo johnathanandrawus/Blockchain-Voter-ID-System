@@ -646,3 +646,301 @@
         max-chain-length: (var-get max-delegation-chain),
         expiry-blocks: (var-get delegation-expiry-blocks)
     })
+
+(define-map fraud-detection
+  { voter-id: uint }
+  {
+    reputation-score: uint,
+    suspicious-activity-count: uint,
+    last-flagged-block: uint,
+    total-flags: uint,
+    is-flagged: bool,
+    verification-level: (string-ascii 20)
+  }
+)
+
+(define-map voting-behavior
+  { voter-id: uint }
+  {
+    total-votes: uint,
+    failed-vote-attempts: uint,
+    rapid-vote-attempts: uint,
+    last-vote-block: uint,
+    average-time-between-votes: uint
+  }
+)
+
+(define-map fraud-reports
+  { report-id: uint }
+  {
+    reporter-id: uint,
+    reported-voter-id: uint,
+    reason: (string-ascii 200),
+    reported-at: uint,
+    status: (string-ascii 20),
+    reviewed-by: (optional principal)
+  }
+)
+
+(define-data-var last-report-id uint u0)
+(define-data-var fraud-detection-enabled bool true)
+(define-data-var reputation-threshold uint u50)
+(define-data-var rapid-vote-threshold uint u10)
+
+(define-private (initialize-fraud-detection (voter-id-param uint))
+    (map-set fraud-detection
+        { voter-id: voter-id-param }
+        {
+            reputation-score: u100,
+            suspicious-activity-count: u0,
+            last-flagged-block: u0,
+            total-flags: u0,
+            is-flagged: false,
+            verification-level: "standard"
+        }
+    ))
+
+(define-private (initialize-voting-behavior (voter-id-param uint))
+    (map-set voting-behavior
+        { voter-id: voter-id-param }
+        {
+            total-votes: u0,
+            failed-vote-attempts: u0,
+            rapid-vote-attempts: u0,
+            last-vote-block: u0,
+            average-time-between-votes: u0
+        }
+    ))
+
+(define-private (update-voting-behavior-on-vote (voter-id-param uint))
+    (let
+        ((current-behavior (default-to 
+            { total-votes: u0, failed-vote-attempts: u0, rapid-vote-attempts: u0, last-vote-block: u0, average-time-between-votes: u0 }
+            (map-get? voting-behavior { voter-id: voter-id-param })))
+         (blocks-since-last-vote (if (> (get last-vote-block current-behavior) u0)
+            (- stacks-block-height (get last-vote-block current-behavior))
+            u0))
+         (is-rapid (and (> (get last-vote-block current-behavior) u0) (< blocks-since-last-vote (var-get rapid-vote-threshold))))
+         (new-total-votes (+ (get total-votes current-behavior) u1))
+         (new-avg (if (> new-total-votes u1)
+            (/ (+ (* (get average-time-between-votes current-behavior) (- new-total-votes u1)) blocks-since-last-vote) new-total-votes)
+            blocks-since-last-vote)))
+        (map-set voting-behavior
+            { voter-id: voter-id-param }
+            {
+                total-votes: new-total-votes,
+                failed-vote-attempts: (get failed-vote-attempts current-behavior),
+                rapid-vote-attempts: (if is-rapid (+ (get rapid-vote-attempts current-behavior) u1) (get rapid-vote-attempts current-behavior)),
+                last-vote-block: stacks-block-height,
+                average-time-between-votes: new-avg
+            }
+        )
+        (if is-rapid
+            (flag-suspicious-activity voter-id-param "rapid-voting")
+            (ok true))))
+
+(define-private (update-voting-behavior-on-failure (voter-id-param uint))
+    (let
+        ((current-behavior (default-to 
+            { total-votes: u0, failed-vote-attempts: u0, rapid-vote-attempts: u0, last-vote-block: u0, average-time-between-votes: u0 }
+            (map-get? voting-behavior { voter-id: voter-id-param })))
+         (new-failed-attempts (+ (get failed-vote-attempts current-behavior) u1)))
+        (map-set voting-behavior
+            { voter-id: voter-id-param }
+            {
+                total-votes: (get total-votes current-behavior),
+                failed-vote-attempts: new-failed-attempts,
+                rapid-vote-attempts: (get rapid-vote-attempts current-behavior),
+                last-vote-block: (get last-vote-block current-behavior),
+                average-time-between-votes: (get average-time-between-votes current-behavior)
+            }
+        )
+        (if (>= new-failed-attempts u5)
+            (flag-suspicious-activity voter-id-param "multiple-failures")
+            (ok true))))
+
+(define-private (flag-suspicious-activity (voter-id-param uint) (reason (string-ascii 20)))
+    (let
+        ((current-detection (default-to 
+            { reputation-score: u100, suspicious-activity-count: u0, last-flagged-block: u0, total-flags: u0, is-flagged: false, verification-level: "standard" }
+            (map-get? fraud-detection { voter-id: voter-id-param })))
+         (new-suspicious-count (+ (get suspicious-activity-count current-detection) u1))
+         (new-total-flags (+ (get total-flags current-detection) u1))
+         (reputation-penalty u10)
+         (new-reputation (if (>= (get reputation-score current-detection) reputation-penalty)
+            (- (get reputation-score current-detection) reputation-penalty)
+            u0))
+         (should-flag (or (>= new-suspicious-count u3) (< new-reputation (var-get reputation-threshold)))))
+        (map-set fraud-detection
+            { voter-id: voter-id-param }
+            {
+                reputation-score: new-reputation,
+                suspicious-activity-count: new-suspicious-count,
+                last-flagged-block: stacks-block-height,
+                total-flags: new-total-flags,
+                is-flagged: should-flag,
+                verification-level: (if should-flag "flagged" (get verification-level current-detection))
+            }
+        )
+        (ok true)))
+
+(define-private (increase-reputation (voter-id-param uint) (amount uint))
+    (let
+        ((current-detection (default-to 
+            { reputation-score: u100, suspicious-activity-count: u0, last-flagged-block: u0, total-flags: u0, is-flagged: false, verification-level: "standard" }
+            (map-get? fraud-detection { voter-id: voter-id-param })))
+         (new-reputation (if (<= (+ (get reputation-score current-detection) amount) u100)
+            (+ (get reputation-score current-detection) amount)
+            u100)))
+        (map-set fraud-detection
+            { voter-id: voter-id-param }
+            {
+                reputation-score: new-reputation,
+                suspicious-activity-count: (get suspicious-activity-count current-detection),
+                last-flagged-block: (get last-flagged-block current-detection),
+                total-flags: (get total-flags current-detection),
+                is-flagged: (get is-flagged current-detection),
+                verification-level: (get verification-level current-detection)
+            }
+        )
+        (ok true)))
+
+(define-public (submit-fraud-report
+    (reported-voter-id uint)
+    (reason (string-ascii 200)))
+    (let
+        ((reporter-voter-id (unwrap! (get-voter-id tx-sender) (err u404)))
+         (reporter-record (unwrap! (map-get? voter-records { voter-id: reporter-voter-id }) (err u404)))
+         (reported-record (unwrap! (map-get? voter-records { voter-id: reported-voter-id }) (err u404)))
+         (new-report-id (+ (var-get last-report-id) u1)))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (not (is-eq reporter-voter-id reported-voter-id)) (err u400))
+        (asserts! (is-eq (get status reporter-record) "active") (err u407))
+        (asserts! (> (get expires-at reporter-record) stacks-block-height) (err u408))
+        
+        (map-set fraud-reports
+            { report-id: new-report-id }
+            {
+                reporter-id: reporter-voter-id,
+                reported-voter-id: reported-voter-id,
+                reason: reason,
+                reported-at: stacks-block-height,
+                status: "pending",
+                reviewed-by: none
+            }
+        )
+        (var-set last-report-id new-report-id)
+        (unwrap! (flag-suspicious-activity reported-voter-id "fraud-report") (err u500))
+        (ok new-report-id)))
+
+(define-public (review-fraud-report
+    (report-id uint)
+    (decision (string-ascii 20)))
+    (let
+        ((report-data (unwrap! (map-get? fraud-reports { report-id: report-id }) (err u404)))
+         (reported-voter-id (get reported-voter-id report-data)))
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (asserts! (is-eq (get status report-data) "pending") (err u400))
+        
+        (map-set fraud-reports
+            { report-id: report-id }
+            {
+                reporter-id: (get reporter-id report-data),
+                reported-voter-id: reported-voter-id,
+                reason: (get reason report-data),
+                reported-at: (get reported-at report-data),
+                status: decision,
+                reviewed-by: (some tx-sender)
+            }
+        )
+        (if (is-eq decision "confirmed")
+            (flag-suspicious-activity reported-voter-id "confirmed-fraud")
+            (if (is-eq decision "dismissed")
+                (increase-reputation reported-voter-id u5)
+                (ok true)))))
+
+(define-public (clear-voter-flags (voter-id-param uint))
+    (let
+        ((current-detection (unwrap! (map-get? fraud-detection { voter-id: voter-id-param }) (err u404))))
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        
+        (map-set fraud-detection
+            { voter-id: voter-id-param }
+            {
+                reputation-score: u100,
+                suspicious-activity-count: u0,
+                last-flagged-block: (get last-flagged-block current-detection),
+                total-flags: (get total-flags current-detection),
+                is-flagged: false,
+                verification-level: "verified"
+            }
+        )
+        (ok true)))
+
+(define-public (upgrade-verification-level (voter-id-param uint) (level (string-ascii 20)))
+    (let
+        ((current-detection (unwrap! (map-get? fraud-detection { voter-id: voter-id-param }) (err u404))))
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        
+        (map-set fraud-detection
+            { voter-id: voter-id-param }
+            {
+                reputation-score: (get reputation-score current-detection),
+                suspicious-activity-count: (get suspicious-activity-count current-detection),
+                last-flagged-block: (get last-flagged-block current-detection),
+                total-flags: (get total-flags current-detection),
+                is-flagged: (get is-flagged current-detection),
+                verification-level: level
+            }
+        )
+        (ok true)))
+
+(define-read-only (get-fraud-detection-data (voter-id-param uint))
+    (map-get? fraud-detection { voter-id: voter-id-param }))
+
+(define-read-only (get-voting-behavior (voter-id-param uint))
+    (map-get? voting-behavior { voter-id: voter-id-param }))
+
+(define-read-only (get-fraud-report (report-id uint))
+    (map-get? fraud-reports { report-id: report-id }))
+
+(define-read-only (is-voter-trustworthy (voter-id-param uint))
+    (let
+        ((fraud-data (map-get? fraud-detection { voter-id: voter-id-param })))
+        (match fraud-data
+            data (and 
+                (not (get is-flagged data))
+                (>= (get reputation-score data) (var-get reputation-threshold)))
+            true)))
+
+(define-read-only (get-voter-risk-level (voter-id-param uint))
+    (let
+        ((fraud-data (map-get? fraud-detection { voter-id: voter-id-param }))
+         (behavior-data (map-get? voting-behavior { voter-id: voter-id-param })))
+        (match fraud-data
+            f-data
+            (let
+                ((reputation (get reputation-score f-data))
+                 (is-flagged (get is-flagged f-data))
+                 (rapid-attempts (match behavior-data b-data (get rapid-vote-attempts b-data) u0)))
+                (if is-flagged
+                    "high"
+                    (if (< reputation u50)
+                        "medium"
+                        (if (> rapid-attempts u3)
+                            "medium"
+                            "low"))))
+            "low")))
+
+(define-public (toggle-fraud-detection)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (ok (var-set fraud-detection-enabled (not (var-get fraud-detection-enabled))))))
+
+(define-read-only (get-fraud-detection-status)
+    {
+        enabled: (var-get fraud-detection-enabled),
+        reputation-threshold: (var-get reputation-threshold),
+        rapid-vote-threshold: (var-get rapid-vote-threshold),
+        total-reports: (var-get last-report-id)
+    })
