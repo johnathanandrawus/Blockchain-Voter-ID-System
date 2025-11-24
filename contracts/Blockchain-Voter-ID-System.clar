@@ -944,3 +944,176 @@
         rapid-vote-threshold: (var-get rapid-vote-threshold),
         total-reports: (var-get last-report-id)
     })
+
+(define-map vote-amendments
+  { event-id: uint, voter-id: uint }
+  {
+    original-vote: (string-ascii 50),
+    current-vote: (string-ascii 50),
+    amendment-count: uint,
+    last-amended-at: uint,
+    amendment-history: (list 5 { vote: (string-ascii 50), amended-at: uint })
+  }
+)
+
+(define-data-var amendment-enabled bool true)
+(define-data-var amendment-window-blocks uint u144)
+(define-data-var max-amendments-per-vote uint u3)
+
+(define-public (amend-vote
+    (event-id uint)
+    (voter-id-param uint)
+    (new-vote-choice (string-ascii 50)))
+    (let
+        ((event-data (unwrap! (map-get? voting-events { event-id: event-id }) (err u404)))
+         (voter-record (unwrap! (map-get? voter-records { voter-id: voter-id-param }) (err u404)))
+         (nft-owner (unwrap! (nft-get-owner? voter-id voter-id-param) (err u404)))
+         (participation (unwrap! (map-get? voter-participation { event-id: event-id, voter-id: voter-id-param }) (err u404)))
+         (amendment-data (map-get? vote-amendments { event-id: event-id, voter-id: voter-id-param }))
+         (voted-at (get voted-at participation))
+         (current-vote (get vote-choice participation))
+         (blocks-since-vote (- stacks-block-height voted-at)))
+        (asserts! (var-get amendment-enabled) (err u403))
+        (asserts! (not (var-get paused)) (err u403))
+        (asserts! (is-eq tx-sender nft-owner) (err u401))
+        (asserts! (get active event-data) (err u400))
+        (asserts! (< stacks-block-height (get end-block event-data)) (err u406))
+        (asserts! (is-eq (get status voter-record) "active") (err u407))
+        (asserts! (<= blocks-since-vote (var-get amendment-window-blocks)) (err u412))
+        (asserts! (not (is-eq current-vote new-vote-choice)) (err u413))
+        (match amendment-data
+            existing-amendment
+            (let
+                ((amendment-count (get amendment-count existing-amendment))
+                 (history (get amendment-history existing-amendment)))
+                (asserts! (< amendment-count (var-get max-amendments-per-vote)) (err u414))
+                (map-set vote-amendments
+                    { event-id: event-id, voter-id: voter-id-param }
+                    {
+                        original-vote: (get original-vote existing-amendment),
+                        current-vote: new-vote-choice,
+                        amendment-count: (+ amendment-count u1),
+                        last-amended-at: stacks-block-height,
+                        amendment-history: (unwrap! (as-max-len? (append history { vote: new-vote-choice, amended-at: stacks-block-height }) u5) (err u415))
+                    }
+                ))
+            (map-set vote-amendments
+                { event-id: event-id, voter-id: voter-id-param }
+                {
+                    original-vote: current-vote,
+                    current-vote: new-vote-choice,
+                    amendment-count: u1,
+                    last-amended-at: stacks-block-height,
+                    amendment-history: (list { vote: new-vote-choice, amended-at: stacks-block-height })
+                }
+            )
+        )
+        (map-set voter-participation
+            { event-id: event-id, voter-id: voter-id-param }
+            {
+                voted-at: voted-at,
+                vote-choice: new-vote-choice
+            }
+        )
+        (ok true)))
+
+(define-read-only (get-amendment-data (event-id uint) (voter-id-param uint))
+    (map-get? vote-amendments { event-id: event-id, voter-id: voter-id-param }))
+
+(define-read-only (can-amend-vote (event-id uint) (voter-id-param uint))
+    (let
+        ((event-data (map-get? voting-events { event-id: event-id }))
+         (participation (map-get? voter-participation { event-id: event-id, voter-id: voter-id-param }))
+         (amendment-data (map-get? vote-amendments { event-id: event-id, voter-id: voter-id-param })))
+        (match event-data
+            event
+            (match participation
+                part
+                (let
+                    ((voted-at (get voted-at part))
+                     (blocks-since-vote (- stacks-block-height voted-at))
+                     (amendment-count (match amendment-data amend (get amendment-count amend) u0)))
+                    {
+                        can-amend: (and
+                            (var-get amendment-enabled)
+                            (get active event)
+                            (< stacks-block-height (get end-block event))
+                            (<= blocks-since-vote (var-get amendment-window-blocks))
+                            (< amendment-count (var-get max-amendments-per-vote))),
+                        blocks-remaining: (if (<= blocks-since-vote (var-get amendment-window-blocks))
+                            (- (var-get amendment-window-blocks) blocks-since-vote)
+                            u0),
+                        amendments-remaining: (if (< amendment-count (var-get max-amendments-per-vote))
+                            (- (var-get max-amendments-per-vote) amendment-count)
+                            u0),
+                        amendment-count: amendment-count
+                    })
+                {
+                    can-amend: false,
+                    blocks-remaining: u0,
+                    amendments-remaining: u0,
+                    amendment-count: u0
+                })
+            {
+                can-amend: false,
+                blocks-remaining: u0,
+                amendments-remaining: u0,
+                amendment-count: u0
+            })))
+
+(define-read-only (get-vote-history (event-id uint) (voter-id-param uint))
+    (let
+        ((participation (map-get? voter-participation { event-id: event-id, voter-id: voter-id-param }))
+         (amendment-data (map-get? vote-amendments { event-id: event-id, voter-id: voter-id-param })))
+        (match participation
+            part
+            (match amendment-data
+                amend
+                {
+                    original-vote: (get original-vote amend),
+                    current-vote: (get current-vote amend),
+                    voted-at: (get voted-at part),
+                    amendment-count: (get amendment-count amend),
+                    last-amended-at: (get last-amended-at amend),
+                    has-amendments: true
+                }
+                {
+                    original-vote: (get vote-choice part),
+                    current-vote: (get vote-choice part),
+                    voted-at: (get voted-at part),
+                    amendment-count: u0,
+                    last-amended-at: u0,
+                    has-amendments: false
+                })
+            {
+                original-vote: "",
+                current-vote: "",
+                voted-at: u0,
+                amendment-count: u0,
+                last-amended-at: u0,
+                has-amendments: false
+            })))
+
+(define-public (toggle-amendment-system)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (ok (var-set amendment-enabled (not (var-get amendment-enabled))))))
+
+(define-public (update-amendment-window (new-window-blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (asserts! (> new-window-blocks u0) (err u400))
+        (ok (var-set amendment-window-blocks new-window-blocks))))
+
+(define-public (update-max-amendments (new-max uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u401))
+        (asserts! (and (> new-max u0) (<= new-max u5)) (err u400))
+        (ok (var-set max-amendments-per-vote new-max))))
+
+(define-read-only (get-amendment-settings)
+    {
+        enabled: (var-get amendment-enabled),
+        window-blocks: (var-get amendment-window-blocks),
+        max-amendments: (var-get max-amendments-per-vote)
+    })
